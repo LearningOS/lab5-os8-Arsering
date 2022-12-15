@@ -4,13 +4,15 @@ use crate::{
     trap::{trap_handler, TrapContext},
 };
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
+use super::sync::sys_enable_deadlock_detect;
 
-/// entry:是一个函数的地址，将它写入新建的task的tarpContext的sepc中，这样在调度到task时，trap返回后会自动执行这个函数 
+/// entry:是一个函数的地址，将它写入新建的task的tarpContext的sepc中，这样在调度到task时，trap返回后会自动执行这个函数
 pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     let task = current_task().unwrap();
     let process = task.process.upgrade().unwrap(); // upgrade的结果：如果process已死，返回一个None
-    // create a new thread
+                                                   // create a new thread
     let new_task = Arc::new(TaskControlBlock::new(
         Arc::clone(&process),
         task.inner_exclusive_access()
@@ -39,7 +41,38 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
     while tasks.len() < new_task_tid + 1 {
         tasks.push(None);
     }
+
     tasks[new_task_tid] = Some(Arc::clone(&new_task));
+    drop(tasks);
+
+    // 为dead_lock_detect_block初始化: 为新建的thread更新need矩阵
+    let dead_lock_detect_block = &mut process_inner.dead_lock_detect_block;
+    while dead_lock_detect_block.need_semaphore.len() < new_task_tid + 1 {
+        dead_lock_detect_block.need_semaphore.push(Vec::new());
+        dead_lock_detect_block.allocation_semaphore.push(Vec::new());
+        dead_lock_detect_block.need_mutex.push(Vec::new());
+        dead_lock_detect_block.allocation_mutex.push(Vec::new());
+    }
+    for (id, _) in dead_lock_detect_block.available_semaphore.iter().enumerate() {
+        if dead_lock_detect_block.need_semaphore[new_task_tid].get(id).is_none(){
+            dead_lock_detect_block.need_semaphore[new_task_tid].push(0);
+            dead_lock_detect_block.allocation_semaphore[new_task_tid].push(0);
+        } else {
+            dead_lock_detect_block.need_semaphore[new_task_tid][id] = 0;
+            dead_lock_detect_block.allocation_semaphore[new_task_tid][id] = 0;
+        }
+    }
+
+    for (id, _) in dead_lock_detect_block.available_mutex.iter().enumerate() {
+        if dead_lock_detect_block.need_mutex[new_task_tid].get(id).is_none(){
+            dead_lock_detect_block.need_mutex[new_task_tid].push(0);
+            dead_lock_detect_block.allocation_mutex[new_task_tid].push(0);
+        } else {
+            dead_lock_detect_block.need_mutex[new_task_tid][id] = 0;
+            dead_lock_detect_block.allocation_mutex[new_task_tid][id] = 0;
+        }
+    }
+
     // add new task to scheduler
     add_task(Arc::clone(&new_task));
     new_task_tid as isize
@@ -68,7 +101,7 @@ pub fn sys_waittid(tid: usize) -> i32 {
     if task_inner.res.as_ref().unwrap().tid == tid {
         return -1;
     }
-    
+
     // 如果找到 tid 对应的退出线程，则收集该退出线程的退出码 exit_tid ，否则返回错误
     let mut exit_code: Option<i32> = None;
     let waited_task = process_inner.tasks[tid].as_ref();
@@ -81,7 +114,6 @@ pub fn sys_waittid(tid: usize) -> i32 {
         return -1;
     }
 
-    
     if let Some(exit_code) = exit_code {
         // dealloc the exited thread
         process_inner.tasks[tid] = None;
